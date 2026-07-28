@@ -1,3 +1,5 @@
 requests
 openpyxl
+beautifulsoup4
+lxml
 supabase
