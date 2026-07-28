@@ -21,7 +21,7 @@ jobs:
         run: |
           hour=$(TZ=Africa/Cairo date +%H)
           echo "Current Cairo hour: $hour"
-          if [ "$hour" != "19" ]; then
+          if [ "$hour" != "19" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
             echo "Not 19:00 in Cairo (DST offset didn't match this cron slot) — skipping."
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
