@@ -1,14 +1,18 @@
-name: Daily DMS extraction (7pm Cairo)
+name: Daily DMS extraction (00:20 Cairo)
 
 on:
   schedule:
     # Cairo now observes DST (EEST, UTC+3) roughly late-Apr -> late-Oct,
     # and EET (UTC+2) the rest of the year. GitHub Actions cron is UTC-only
     # and does NOT auto-adjust for DST, so we schedule BOTH possible UTC
-    # times and let the "Check it's actually 7pm in Cairo" step below skip
+    # times and let the "Check it's actually 00:20 in Cairo" step below skip
     # the wrong one. You don't need to touch this twice a year.
-    - cron: "0 16 * * *"   # 19:00 Cairo when Cairo is UTC+3 (EEST, summer)
-    - cron: "0 17 * * *"   # 19:00 Cairo when Cairo is UTC+2 (EET, winter)
+    #
+    # Target: 00:20 Cairo
+    #   EEST (UTC+3, summer): 00:20 - 3h = 21:20 UTC the PREVIOUS day
+    #   EET  (UTC+2, winter): 00:20 - 2h = 22:20 UTC the PREVIOUS day
+    - cron: "20 21 * * *"   # 00:20 Cairo when Cairo is UTC+3 (EEST, summer)
+    - cron: "20 22 * * *"   # 00:20 Cairo when Cairo is UTC+2 (EET, winter)
   workflow_dispatch: {}    # lets you also trigger it manually from the Actions tab
 
 jobs:
@@ -16,13 +20,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Check it's actually 7pm in Cairo right now
+      - name: Check it's actually ~00:20 in Cairo right now
         id: gate
         run: |
-          hour=$(TZ=Africa/Cairo date +%H)
-          echo "Current Cairo hour: $hour"
-          if [ "$hour" != "19" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            echo "Not 19:00 in Cairo (DST offset didn't match this cron slot) — skipping."
+          # GitHub's scheduled triggers are best-effort and can be delayed
+          # by anywhere from a few minutes to over an hour at busy times,
+          # so instead of requiring an exact HH:MM match we check that
+          # we're within a window after the 00:20 target. This also means
+          # only ONE of the two cron slots (summer/winter) will ever be
+          # "in window" on a given day, so there's no risk of it running twice.
+          now_minutes=$(TZ=Africa/Cairo date +%H:%M | awk -F: '{print $1*60+$2}')
+          target_minutes=$((0*60+20))     # 00:20
+          window_minutes=90               # accept up to 90 min of delay
+
+          echo "Current Cairo time: $(TZ=Africa/Cairo date +%H:%M)"
+
+          diff=$(( (now_minutes - target_minutes + 1440) % 1440 ))
+
+          if [ "$diff" -gt "$window_minutes" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "Not within the 00:20 Cairo window (DST offset didn't match this cron slot, or GitHub delayed the trigger too much) — skipping."
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
