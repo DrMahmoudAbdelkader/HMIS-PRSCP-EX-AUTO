@@ -1,5 +1,16 @@
 name: Daily DMS extraction (20:00 Cairo)
 
+# PIPELINE
+#   plan        validate dates, build the list of days
+#   queue       one parallel job PER DAY: which MR codes arrived (fast, no charts)
+#   distribute  de-duplicate MR codes within each day and across the whole
+#               period, attach each MR's dates, split into even chunks (~50)
+#   extract     one parallel job PER CHUNK: open each patient page ONCE and
+#               extract everything dated on any of that patient's queue dates
+#   combine     merge all chunks into one workbook (+ audit files)
+#
+# The 20:00 Cairo cron runs the same pipeline for "today" (one day).
+
 on:
   schedule:
     # Cairo observes DST (EEST, UTC+3) roughly late-Apr -> late-Oct, and
@@ -16,21 +27,53 @@ on:
     - cron: "0 18 * * *"   # 20:00 Cairo when Cairo is UTC+2 (EET, winter)
   workflow_dispatch:       # manual run from the Actions tab
     inputs:
-      run_date:
-        description: "Optional run date dd-mm-yyyy (blank = today, Cairo time)"
+      from_date:
+        description: "From date dd-mm-yyyy (blank = today, Cairo time)"
         required: false
         default: ""
+      to_date:
+        description: "To date dd-mm-yyyy, inclusive (blank = same as from date)"
+        required: false
+        default: ""
+      patients_per_job:
+        description: "Patients per parallel extraction job"
+        required: false
+        default: "50"
+      max_parallel_days:
+        description: "How many days collect their queue at the same time"
+        required: false
+        default: "10"
+      max_parallel_jobs:
+        description: "How many extraction jobs run at the same time (free plan caps at 20)"
+        required: false
+        default: "20"
 
-# Never let two runs overlap (a full run takes ~65-70 min): a second run
-# waits for the first instead of hitting HMIS/Supabase at the same time.
+# Never let two runs overlap: a second run waits for the first instead of
+# hitting HMIS/Supabase at the same time.
 concurrency:
   group: daily-dms-extraction
   cancel-in-progress: false
 
+env:
+  # Python buffers stdout when piped (as in Actions) and dumps it in bursts,
+  # which looks like a frozen step. Unbuffered = live log.
+  PYTHONUNBUFFERED: "1"
+  TZ: Africa/Cairo
+
 jobs:
-  extract:
+  # ─────────────────────────────────────────────────────────────────
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # the per-patient scraping loop needs ~65-70 min for a full run; headroom for slower nights
+    timeout-minutes: 5
+    outputs:
+      run:               ${{ steps.gate.outputs.run }}
+      days:              ${{ steps.days.outputs.days }}
+      n_days:            ${{ steps.days.outputs.n_days }}
+      label:             ${{ steps.days.outputs.label }}
+      single_day:        ${{ steps.days.outputs.single_day }}
+      per_job:           ${{ steps.days.outputs.per_job }}
+      queue_parallel:    ${{ steps.days.outputs.queue_parallel }}
+      extract_parallel:  ${{ steps.days.outputs.extract_parallel }}
     steps:
       - name: Gate - run only the cron slot that matches Cairo's current UTC offset
         id: gate
@@ -39,12 +82,9 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
         run: |
           # GitHub's scheduled triggers are best-effort and can be delayed
-          # by minutes to over an hour. The old approach (accept anything
-          # within 90 min after 20:00 Cairo) let BOTH cron slots through in
-          # summer (17:00 UTC -> 20:00 Cairo, and 18:00 UTC -> 21:00 Cairo),
-          # so the extraction ran twice every night. Instead, decide by
-          # WHICH slot fired: it must be the one matching Cairo's UTC
-          # offset right now, however late GitHub starts it.
+          # by minutes to over an hour. Decide by WHICH slot fired: it must
+          # be the one matching Cairo's UTC offset right now, however late
+          # GitHub starts it.
           offset=$(TZ=Africa/Cairo date +%z)      # +0300 (summer) or +0200 (winter)
           if [ "$offset" = "+0300" ]; then expected="0 17 * * *"; else expected="0 18 * * *"; fi
 
@@ -59,52 +99,282 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v4
-        if: steps.gate.outputs.run == 'true'
-
-      - uses: actions/setup-python@v5
-        if: steps.gate.outputs.run == 'true'
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        if: steps.gate.outputs.run == 'true'
-        run: pip install -r requirements.txt
-
-      - name: Run the coupled extraction pipeline
+      - name: Build the list of days
+        id: days
         if: steps.gate.outputs.run == 'true'
         env:
-          # The script's default RUN_DATE is datetime.now(); pin the runner's
-          # clock to Cairo so "today" is always the Cairo date.
-          TZ: Africa/Cairo
-          INPUT_RUN_DATE: ${{ github.event.inputs.run_date }}
+          IN_FROM: ${{ github.event.inputs.from_date }}
+          IN_TO: ${{ github.event.inputs.to_date }}
+          IN_PER_JOB: ${{ github.event.inputs.patients_per_job }}
+          IN_QPAR: ${{ github.event.inputs.max_parallel_days }}
+          IN_XPAR: ${{ github.event.inputs.max_parallel_jobs }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          from datetime import datetime, timedelta
+          MAX_DAYS = 62      # typo guard - raise if you really need longer periods
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          def parse(label, v):
+              try:
+                  return datetime.strptime(v.strip(), "%d-%m-%Y")
+              except ValueError:
+                  fail(f"{label} '{v}' is not a valid dd-mm-yyyy date")
+
+          def to_int(name, default, lo, hi):
+              raw = (os.environ.get(name) or "").strip() or str(default)
+              try:
+                  n = int(raw)
+              except ValueError:
+                  fail(f"{name} '{raw}' is not a number")
+              return max(lo, min(hi, n))
+
+          today = datetime.now().strftime("%d-%m-%Y")      # TZ=Africa/Cairo
+          f = (os.environ.get("IN_FROM") or "").strip() or today
+          t = (os.environ.get("IN_TO") or "").strip() or f
+          d1, d2 = parse("from_date", f), parse("to_date", t)
+          if d2 < d1:
+              fail("to_date is before from_date")
+          n = (d2 - d1).days + 1
+          if n > MAX_DAYS:
+              fail(f"{n} days requested; the limit is {MAX_DAYS} (MAX_DAYS in this step)")
+          days = [(d1 + timedelta(days=i)).strftime("%d-%m-%Y") for i in range(n)]
+          label = days[0] if n == 1 else f"{days[0]}_to_{days[-1]}"
+          out = {
+              "days": json.dumps(days),
+              "n_days": n,
+              "label": label,
+              "single_day": "true" if n == 1 else "false",
+              "per_job": to_int("IN_PER_JOB", 50, 5, 500),
+              "queue_parallel": to_int("IN_QPAR", 10, 1, 20),
+              "extract_parallel": to_int("IN_XPAR", 20, 1, 20),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              for k, v in out.items():
+                  fh.write(f"{k}={v}\n")
+          print(f"Period {days[0]} .. {days[-1]}  ({n} day(s))")
+          print(out)
+          PY
+
+  # ─────────────────────────────────────────────────────────────────
+  # STEP 1: one job per day - who arrived (no patient charts opened here)
+  queue:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    name: Queue ${{ matrix.date }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.plan.outputs.queue_parallel) }}
+      matrix:
+        date: ${{ fromJSON(needs.plan.outputs.days) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect the arrived-patient queue for ${{ matrix.date }}
+        env:
+          # Appointment-dashboard login (HMIS on :8080) - separate from the CMIS account
+          HMIS_QUEUE_USERNAME: ${{ secrets.HMIS_QUEUE_USERNAME }}
+          HMIS_QUEUE_PASSWORD: ${{ secrets.HMIS_QUEUE_PASSWORD }}
+          QUEUE_OUTPUT_DIR: ${{ github.workspace }}/run-output
+        run: |
+          mkdir -p run-output
+          # queue_mr_extractor.py (v13, direct dashboard extraction) must sit next to
+          # queue_day.py in the repo root (it is imported, not run).
+          python -u queue_day.py "${{ matrix.date }}" "run-output/queue_${{ matrix.date }}.json"
+
+      # always(): keep the raw queue audit workbook even when the day fails
+      - name: Upload this day's queue (json + audit workbook)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: queue-${{ matrix.date }}
+          path: run-output/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────
+  # STEP 2: de-duplicate MRs (per day, then across the period) and split evenly
+  distribute:
+    needs: [plan, queue]
+    # Run even when some days' queue jobs failed: one bad day must not throw
+    # away every other day. Missing days are listed and "verify" goes red.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has_chunks:   ${{ steps.chunks.outputs.has_chunks }}
+      chunks:       ${{ steps.chunks.outputs.chunks }}
+      n_chunks:     ${{ steps.chunks.outputs.n_chunks }}
+      missing_days: ${{ steps.chunks.outputs.missing_days }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: queue-*
+          path: queue-in
+          merge-multiple: true
+
+      - name: De-duplicate MR codes and build the chunks
+        id: chunks
+        env:
+          PER_JOB: ${{ needs.plan.outputs.per_job }}
+          SINGLE_DAY: ${{ needs.plan.outputs.single_day }}
+          EXPECTED_DAYS: ${{ needs.plan.outputs.days }}
+        run: |
+          flag=""
+          # A single day with nobody arrived still fails loudly (as before);
+          # inside a multi-day range an empty day/period is just a notice.
+          if [ "$SINGLE_DAY" = "true" ]; then flag="--fail-if-empty"; fi
+          python3 plan_chunks.py --queue-dir queue-in --out-dir chunk-plan \
+            --per-job "$PER_JOB" --max-chunks 250 \
+            --expected-days "$EXPECTED_DAYS" $flag
+
+      - name: Upload the chunk plan (chunks + MR-to-dates audit CSV)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-plan
+          path: chunk-plan/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────
+  # STEP 3: one job per chunk of ~50 patients, all running in parallel
+  extract:
+    needs: [plan, distribute]
+    if: needs.distribute.outputs.has_chunks == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # headroom: a 50-patient chunk is expected to finish far sooner
+    name: Extract chunk ${{ matrix.chunk }}
+    strategy:
+      fail-fast: false     # one failed chunk must not cancel the others
+      max-parallel: ${{ fromJSON(needs.plan.outputs.extract_parallel) }}
+      matrix:
+        chunk: ${{ fromJSON(needs.distribute.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: chunk-plan
+          path: chunk-plan
+
+      - name: Extract chunk ${{ matrix.chunk }}
+        env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           HMIS_USERNAME: ${{ secrets.HMIS_USERNAME }}
           HMIS_PASSWORD: ${{ secrets.HMIS_PASSWORD }}
-          # Appointment-dashboard login (HMIS on :8080) - separate from the CMIS account above
-          HMIS_QUEUE_USERNAME: ${{ secrets.HMIS_QUEUE_USERNAME }}
-          HMIS_QUEUE_PASSWORD: ${{ secrets.HMIS_QUEUE_PASSWORD }}
           QUEUE_OUTPUT_DIR: ${{ github.workspace }}/run-output
-          MASTER_OUTPUT_PATH: ${{ github.workspace }}/run-output/Cumulative_Patient_Clinical_Data.xlsx
         run: |
-          mkdir -p "$QUEUE_OUTPUT_DIR"
-          # queue_mr_extractor.py (v13, direct dashboard extraction) must sit next to
-          # this script in the repo root (it is imported, not run).
-          if [ -n "$INPUT_RUN_DATE" ]; then
-            python Extract_DMS_Patients_Prescriptioned_Services_Data_modified.py "$INPUT_RUN_DATE"
-          else
-            python Extract_DMS_Patients_Prescriptioned_Services_Data_modified.py
-          fi
+          mkdir -p run-output
+          python -u Extract_DMS_Patients_Prescriptioned_Services_Data_modified.py \
+            --chunk "chunk-plan/chunk_${{ matrix.chunk }}.json" \
+            --chunk-out "run-output/chunk_${{ matrix.chunk }}_result.json"
 
-      # always(): keep the raw/CLEAN queue files even when the run fails
-      # (e.g. "no queued patients" or a date-range mismatch) - that is
-      # exactly when you need them.
-      - name: Upload run output as a workflow artifact (audit trail)
-        if: always() && steps.gate.outputs.run == 'true'
+      - name: Upload this chunk's result
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dms-run-output-${{ github.run_id }}
+          name: result-chunk-${{ matrix.chunk }}
           path: run-output/
           if-no-files-found: ignore
           retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────
+  # STEP 4: one combined workbook for the whole period
+  combine:
+    needs: [plan, distribute, extract]
+    # Run even if some chunks failed, so everything that DID extract is still
+    # merged; the job goes red and lists the missing chunks.
+    if: ${{ !cancelled() && needs.distribute.outputs.has_chunks == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-chunk-*
+          path: results
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: chunk-plan
+          path: combined-output/plan
+
+      - name: Merge all chunks into one workbook
+        env:
+          LABEL: ${{ needs.plan.outputs.label }}
+          N_CHUNKS: ${{ needs.distribute.outputs.n_chunks }}
+          MISSING_DAYS: ${{ needs.distribute.outputs.missing_days }}
+        run: |
+          mkdir -p combined-output
+          python -u merge_outputs.py --results-dir results \
+            --out "combined-output/Combined_${LABEL}.xlsx" \
+            --label "${LABEL}" --expected-chunks "$N_CHUNKS" \
+            --missing-days "$MISSING_DAYS"
+
+      - name: Upload the combined output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dms-combined-output-${{ github.run_id }}
+          path: combined-output/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────
+  # STEP 5: final check - red if any day's queue collection failed, even when
+  # everything else succeeded (otherwise a missing day would go unnoticed).
+  verify:
+    needs: [plan, distribute, combine]
+    if: ${{ !cancelled() && needs.plan.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any day is missing
+        env:
+          MISSING_DAYS: ${{ needs.distribute.outputs.missing_days }}
+          DIST_RESULT: ${{ needs.distribute.result }}
+        run: |
+          if [ "$DIST_RESULT" != "success" ]; then
+            echo "::error::The distribute step did not succeed (result: $DIST_RESULT) - no patients were extracted."
+            exit 1
+          fi
+          if [ -n "$MISSING_DAYS" ]; then
+            echo "::error::These days have NO data because their queue job failed: $MISSING_DAYS. Re-run them (from_date/to_date) - it is safe, Supabase de-duplicates."
+            exit 1
+          fi
+          echo "All days collected."
