@@ -82,12 +82,15 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           HMIS_USERNAME: ${{ secrets.HMIS_USERNAME }}
           HMIS_PASSWORD: ${{ secrets.HMIS_PASSWORD }}
+          # Appointment-dashboard login (HMIS on :8080) - separate from the CMIS account above
+          HMIS_QUEUE_USERNAME: ${{ secrets.HMIS_QUEUE_USERNAME }}
+          HMIS_QUEUE_PASSWORD: ${{ secrets.HMIS_QUEUE_PASSWORD }}
           QUEUE_OUTPUT_DIR: ${{ github.workspace }}/run-output
           MASTER_OUTPUT_PATH: ${{ github.workspace }}/run-output/Cumulative_Patient_Clinical_Data.xlsx
         run: |
           mkdir -p "$QUEUE_OUTPUT_DIR"
-          # queue_mr_extractor.py must sit next to this script in the repo root
-          # (it is imported, not run).
+          # queue_mr_extractor.py (v13, direct dashboard extraction) must sit next to
+          # this script in the repo root (it is imported, not run).
           if [ -n "$INPUT_RUN_DATE" ]; then
             python Extract_DMS_Patients_Prescriptioned_Services_Data_modified.py "$INPUT_RUN_DATE"
           else
