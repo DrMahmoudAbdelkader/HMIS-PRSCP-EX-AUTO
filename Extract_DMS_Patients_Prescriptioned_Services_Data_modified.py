@@ -1,6 +1,26 @@
 """
 CMIS MRM Patient Clinical Data Extractor  —  COUPLED daily pipeline
 ======================================================================
+CHANGES IN THIS VERSION (MDT extraction fix)
+---------------------------------------------
+MDT extraction was reading the wrong sheet entirely:
+  * SheetCode was "02" — the real MDT form is SheetCode "09" ("MDT FORM"
+    in the Medical Sheets grid). "02" either matched nothing or matched
+    an unrelated sheet type.
+  * The outcome field was read from "text-5", which isn't a field this
+    form actually saves. The real field is "text-22" ("MDT Outcome &
+    Plan"), confirmed against a live form + its captured network traffic
+    (see the standalone Extract_DMS_Created_MDT_Forms_Content.py, which
+    maps the form's full field set — this pipeline only pulls the one
+    field, "MDT Outcome & Plan", that its "Outcome / Plan" column needs;
+    the other ~12 fields that script extracts, e.g. BX/ER/PR/HER2/KI67,
+    Menopausal Status, Family History, Recommendations, are not pulled
+    here since the "MDT (02)" [now really "(09)"] sheet only ever had
+    one outcome column).
+  * The "Input-21" date field was already read correctly and is
+    unchanged.
+See extract_mdt() and api_medical_sheets()'s target_codes for the fix.
+
 CHANGES IN THIS VERSION (bulk / parallel pipeline)
 --------------------------------------------------
 * NEW  --chunk chunk_<n>.json --chunk-out result.json
@@ -29,7 +49,7 @@ CHANGES IN THIS VERSION (coupling with queue_mr_extractor.py)
        under that day).
 
 2. "Last visit data only, dated today": Investigations, Medical
-   Reports (033) and MDT forms (02) are now filtered to only the
+   Reports (033) and MDT forms (09) are now filtered to only the
    records whose own date equals RUN_DATE. Fetch is still pulled
    fresh per patient (that's how the source system works), but this
    script performs the additional date filtering so the output only
@@ -59,7 +79,7 @@ For each patient (MR) this script still extracts:
   • Patient basic info (from Admission API)
   • Investigations (lab/radiology orders) dated RUN_DATE
   • Medical Reports (SheetCode 033) dated RUN_DATE
-  • MDT forms      (SheetCode 02)  dated RUN_DATE
+  • MDT forms      (SheetCode 09)  dated RUN_DATE
 
 REQUIREMENTS
 ------------
@@ -651,7 +671,12 @@ def api_medical_sheets(session, mr, hosp_code, visit_num) -> tuple:
             grid_html = rp.text
         all_sheets.extend(_parse_medical_sheets(grid_html))
 
-    target_codes = {"033", "02"}
+    # MDT is SheetCode "09" ("MDT FORM" in the Medical Sheets grid) — NOT "02".
+    # "02" was wrong (confirmed against a live MDT form + its captured network
+    # traffic; see Extract_DMS_Created_MDT_Forms_Content.py). Left "02" out of
+    # target_codes entirely: it either matches nothing or matches some other,
+    # unrelated sheet type, so keeping it would silently pull the wrong rows.
+    target_codes = {"033", "09"}
     filtered = [s for s in all_sheets if s.get("SheetCode", "").strip() in target_codes]
     return filtered, token
 
@@ -865,11 +890,24 @@ def extract_medical_report(fields: list, creation_date: str) -> tuple:
 
 def extract_mdt(fields: list, creation_date: str) -> tuple:
     """
-    From MDT form (SheetCode 02) field array:
-      outcome ← fieldName == "text-5"
+    From MDT form (SheetCode "09" — confirmed against a live form + its
+    captured network traffic, see Extract_DMS_Created_MDT_Forms_Content.py)
+    field array:
+      outcome ← fieldName == "text-22"  ("MDT Outcome & Plan" — this is the
+                one field from that script's fuller field map that maps onto
+                this pipeline's single "Outcome / Plan" column; the other
+                ~12 fields it extracts (BX/ER/PR/HER2/KI67, History, Sono,
+                Mets Workup, Recommendations, Menopausal Status, Family
+                History, CO Morbidity) aren't pulled here — this sheet only
+                needs the outcome/plan text and the date)
       date    ← fieldName == "Input-21"  (format "yyyy-mm-dd")
                 fallback to creation_date from sheets table
     Returns (date_str, outcome).
+
+    The previous version of this function read SheetCode "02" / field
+    "text-5", both wrong: "02" isn't the MDT form's SheetCode at all (it's
+    "09"), so this was silently either finding nothing or reading an
+    unrelated sheet, and "text-5" isn't a field this form actually saves.
     """
     outcome  = ""
     date_str = ""
@@ -878,7 +916,7 @@ def extract_mdt(fields: list, creation_date: str) -> tuple:
         fname = f.get("fieldName", "")
         fval  = f.get("fieldValue", "")
 
-        if fname == "text-5":
+        if fname == "text-22":
             outcome = fval
         elif fname == "Input-21" and not date_str:
             date_str = fval  # e.g. "2026-07-08"
@@ -1049,7 +1087,7 @@ def build_statistics(data: dict) -> dict:
         ("Avg. classified investigations / patient", f"{avg_per_patient:.2f}"),
         ("Avg. classified investigations / visit",   f"{avg_per_visit:.2f}"),
         ("Total medical reports (033) extracted",    str(len(med_reports))),
-        ("Total MDT forms (02) extracted",           str(len(mdt))),
+        ("Total MDT forms (09) extracted",           str(len(mdt))),
         ("Patients with ≥1 MDT form",                str(patients_with_mdt)),
     ]
 
@@ -1577,7 +1615,7 @@ def process_patient(session, mr: str, dates: dict, q_nid: str = "") -> tuple:
         inv_kept += 1
     print(f"  Investigations   : {inv_kept} on queue day(s) (of {len(inv_list)} on file)")
 
-    # Medical sheets (033 + 02) - same rule
+    # Medical sheets (033 + 09) - same rule
     time.sleep(DELAY)
     target_sheets, token = api_medical_sheets(session, mr, hosp_code, visit_num)
     mr_count = mdt_count = 0
@@ -1593,7 +1631,7 @@ def process_patient(session, mr: str, dates: dict, q_nid: str = "") -> tuple:
             if date_str in day_set and (description or date_str):
                 reps.append([mr, dates[date_str], eng_name, date_str, description, date_str])
                 mr_count += 1
-        elif code == "02":
+        elif code == "09":
             date_str, outcome = extract_mdt(fields, creation_date)
             if date_str in day_set and (outcome or date_str):
                 mdts.append([mr, dates[date_str], eng_name, date_str, outcome, date_str])
