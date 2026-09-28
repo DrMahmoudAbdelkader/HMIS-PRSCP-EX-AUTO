@@ -1,6 +1,17 @@
 """
 CMIS MRM Patient Clinical Data Extractor  —  COUPLED daily pipeline
 ======================================================================
+CHANGES IN THIS VERSION (bulk / parallel pipeline)
+--------------------------------------------------
+* NEW  --chunk chunk_<n>.json --chunk-out result.json
+       Used by the parallel GitHub jobs. Each patient carries ALL the dates
+       it was queued on ({"mr","national_id","dates":{date: clinic}}); the
+       patient page is opened ONCE and every investigation / medical report /
+       MDT dated on ANY of those days is kept, tagged with that day and the
+       clinic of that day.
+* No queue pull in chunk mode - plan_chunks.py already did it.
+* Old single-day mode still works:  python script.py [dd-mm-yyyy]
+
 CHANGES IN THIS VERSION (coupling with queue_mr_extractor.py)
 -----------------------------------------------------------------
 1. MR codes are no longer read from a hand-prepared Excel file. This
@@ -111,7 +122,10 @@ HOSPITAL_CODE  = "01"           # Default hospital code
 # This is used BOTH as the date the queue is pulled for, AND as the
 # filter applied to investigations/medical reports/MDT (only records
 # dated this same day are kept — "today's visit only").
-RUN_DATE = sys.argv[1] if len(sys.argv) > 1 else datetime.now().strftime("%d-%m-%Y")
+# Default = today. The CLI (bottom of this file) overrides it for single-day
+# runs. NOT read from sys.argv at import time: merge_outputs.py imports this
+# module and has its own arguments.
+RUN_DATE = datetime.now().strftime("%d-%m-%Y")
 
 # Where the queue script's own raw/clean/simplified audit files land.
 QUEUE_OUTPUT_DIR = os.environ.get("QUEUE_OUTPUT_DIR", r"D:\Queue_DMS_Data")
@@ -1493,7 +1507,199 @@ def accumulate_and_save(new_data: dict, master_path: str, run_info: dict,
 
 
 # ═══════════════════════════════════════════════════════════════════
-# MAIN
+# PER-PATIENT EXTRACTION  (one patient page opened ONCE, any number of dates)
+# ═══════════════════════════════════════════════════════════════════
+
+def process_patient(session, mr: str, dates: dict, q_nid: str = "") -> tuple:
+    """
+    Opens ONE patient's chart and extracts everything dated on ANY of the
+    days that patient was queued.
+
+    dates : {"dd-mm-yyyy": clinic_on_that_day, ...}   (never empty)
+
+    Returns (summary_rows, investigation_rows, med_report_rows, mdt_rows),
+    or None when the patient is not authorised. Each row carries the queue
+    date it belongs to as its "Run Date" and the clinic the patient was
+    queued under ON THAT DAY. Raises on failure (caller records the error).
+    """
+    day_set = set(dates)
+    summary, invs, reps, mdts = [], [], [], []
+
+    time.sleep(DELAY)
+    patient_info = api_patient_get_by_mr(session, mr)
+    eng_name = patient_info.get("EngName", "")
+    ar_name  = patient_info.get("ARName", "")
+
+    time.sleep(DELAY)
+    if not api_authorize_patient(session, mr):
+        return None
+
+    time.sleep(DELAY)
+    hosp_code, visit_num = api_draw_tree(session, mr)
+    if visit_num is None:
+        print(f"  ⚠  Could not determine visit number for MR {mr}")
+        visit_num = 0
+    print(f"  HospCode={hosp_code}  VisitNumber={visit_num}")
+
+    time.sleep(DELAY)
+    admission = api_admission(session, mr, hosp_code, visit_num)
+    age    = admission.get("PatientAge", patient_info.get("PatientAge", ""))
+    sex    = admission.get("Sex",        patient_info.get("Sex", ""))
+    id_no  = admission.get("SixFieldDisplayValue", "")
+    if q_nid:
+        if not str(id_no or "").strip():
+            id_no = q_nid
+        elif str(id_no).strip() != q_nid:
+            print(f"  ⚠  National ID differs: CMIS={id_no}  queue={q_nid} "
+                  f"(kept CMIS value) — check MR {mr}")
+    birth_dt = admission.get("FirstFieldDisplayValue", "")
+
+    # one summary row per queue day (same patient info, that day's clinic)
+    for d in sorted(day_set, key=lambda x: datetime.strptime(x, "%d-%m-%Y")):
+        summary.append([mr, dates[d], d, eng_name, ar_name, age, sex,
+                        id_no, birth_dt, hosp_code, visit_num])
+
+    time.sleep(DELAY)
+    api_patient_note(session, mr, hosp_code, visit_num)      # mandatory call, no data kept
+
+    # Investigations - keep rows whose Order Date is one of the queue days
+    time.sleep(DELAY)
+    inv_list = api_investigations(session, mr)
+    inv_kept = 0
+    for inv in inv_list:
+        od = _normalize_any_date(inv["Order Date"])
+        if od not in day_set:
+            continue
+        invs.append([mr, dates[od], inv["Status"], inv["Order Type"], inv["Test Name"],
+                     inv["Physician Comment"], inv["Order Date"],
+                     inv["Requesting Physician"], inv["Schedule Date"],
+                     inv["Order Number"], inv["Case Number"], od])
+        inv_kept += 1
+    print(f"  Investigations   : {inv_kept} on queue day(s) (of {len(inv_list)} on file)")
+
+    # Medical sheets (033 + 02) - same rule
+    time.sleep(DELAY)
+    target_sheets, token = api_medical_sheets(session, mr, hosp_code, visit_num)
+    mr_count = mdt_count = 0
+    for sheet in target_sheets:
+        time.sleep(DELAY)
+        sheet_url = api_get_sheet_url(session, sheet, token)
+        time.sleep(DELAY)
+        fields = api_get_user_control_data(session, sheet_url, mr, hosp_code, visit_num, sheet)
+        creation_date = sheet.get("CreationDate", "")
+        code = sheet["SheetCode"].strip()
+        if code == "033":
+            date_str, description = extract_medical_report(fields, creation_date)
+            if date_str in day_set and (description or date_str):
+                reps.append([mr, dates[date_str], eng_name, date_str, description, date_str])
+                mr_count += 1
+        elif code == "02":
+            date_str, outcome = extract_mdt(fields, creation_date)
+            if date_str in day_set and (outcome or date_str):
+                mdts.append([mr, dates[date_str], eng_name, date_str, outcome, date_str])
+                mdt_count += 1
+    print(f"  Medical Reports  : {mr_count}   MDT Forms : {mdt_count}")
+    return summary, invs, reps, mdts
+
+
+def run_patients(patients: list) -> tuple:
+    """patients: [{"mr", "national_id", "dates": {date: clinic}}]. Logs in once."""
+    print("\n── Logging in to CMIS MRM …")
+    session = build_session()
+    try:
+        if not login(session):
+            sys.exit(1)
+    except requests.exceptions.ConnectionError:
+        print("\n❌  Cannot reach the server.  Make sure you are connected to the hospital network.")
+        sys.exit(1)
+
+    data = {k: [] for k in _SHEET_KEYS}
+    errors = []
+    total = len(patients)
+    for idx, p in enumerate(patients, 1):
+        mr, dates = p["mr"], p["dates"]
+        print(f"\n{'─' * 65}")
+        print(f"  [{idx}/{total}]  MR = {mr}   Days = {', '.join(sorted(dates))}")
+        try:
+            res = process_patient(session, mr, dates, p.get("national_id", ""))
+            if res is None:
+                print(f"  ⚠  Not authorized for MR {mr} — skipping")
+                errors.append((mr, "Not authorized"))
+                continue
+            for key, rows in zip(_SHEET_KEYS, res):
+                data[key].extend(rows)
+        except requests.exceptions.ConnectionError as exc:
+            print(f"  ❌  Connection error: {exc}")
+            errors.append((mr, f"ConnectionError: {exc}"))
+        except requests.exceptions.Timeout:
+            print("  ❌  Request timed out")
+            errors.append((mr, "Timeout"))
+        except Exception as exc:
+            print(f"  ❌  Unexpected error: {exc}")
+            traceback.print_exc()
+            errors.append((mr, str(exc)))
+    return data, errors
+
+
+def _push_new_rows(new_data: dict) -> str:
+    """Upsert this run's rows to Supabase -> 'ok' | 'disabled' | 'partial failure ...'."""
+    if not PUSH_TO_SUPABASE:
+        return "disabled"
+    print("\n── Testing Supabase connection …")
+    if not test_supabase_connection():
+        print("  ⚠  Excel/JSON only for this run.")
+        return "disabled"
+    ok_all, pushed = True, False
+    for key in _SHEET_KEYS:
+        rows, _ = merge_rows([], new_data[key])   # drop in-batch duplicates (an upsert batch can't contain the same row_hash twice)
+        if rows:
+            pushed = True
+            ok_all = push_rows_to_supabase(key, _SHEET_COLUMNS[key], rows) and ok_all
+    return "ok" if (ok_all or not pushed) else "partial failure — see console"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODE A - CHUNK  (used by the parallel GitHub jobs)
+#   python script.py --chunk chunk_3.json --chunk-out chunk_3_result.json
+# ═══════════════════════════════════════════════════════════════════
+
+def main_chunk(chunk_path: str, out_path: str):
+    with open(chunk_path, encoding="utf-8") as f:
+        chunk = json.load(f)
+    patients = chunk["patients"]
+    n_days = sum(len(p["dates"]) for p in patients)
+
+    print("=" * 65)
+    print(f"  CMIS MRM — chunk {chunk['chunk']}:  {len(patients)} patient(s), {n_days} patient-day(s)")
+    print("=" * 65)
+
+    data, errors = run_patients(patients)
+    status = _push_new_rows(data)
+
+    result = {
+        "chunk": chunk["chunk"],
+        "patients_in_chunk": len(patients),
+        "rows": data,
+        "errors": [[m, str(w)] for m, w in errors],
+        "supabase_status": status,
+    }
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, default=str)
+
+    print(f"\n{'=' * 65}")
+    print(f"  ✅  Chunk {chunk['chunk']} done: {len({r[0] for r in data['summary']})}/{len(patients)} patients, "
+          f"{len(data['investigations'])} investigations, {len(data['medical_reports'])} reports, "
+          f"{len(data['mdt'])} MDT, {len(errors)} error(s), supabase={status}")
+    print(f"  Result → {out_path}")
+    if status.startswith("partial"):
+        print("::error::Supabase push failed for this chunk (rows are in the result JSON; re-run is safe).")
+        sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODE B - SINGLE DAY, ONE SESSION  (local runs / old behaviour)
+#   python script.py [dd-mm-yyyy]
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
@@ -1505,10 +1711,34 @@ def main():
     print(f"  Master output: {MASTER_OUTPUT_PATH}")
     print("=" * 65)
 
-    # ── 0. Decide (once) whether Supabase push is actually usable ──
-    # Uses a LOCAL variable, never mutates the module-level config —
-    # this avoids the earlier 'global' misuse that crashed the script
-    # with a SyntaxError before it could even start.
+    print(f"\n── Pulling queue for {RUN_DATE} (source of MR codes + clinic) …")
+    try:
+        queue_rows = queue_mr_extractor.get_queue_records(RUN_DATE, output_dir=QUEUE_OUTPUT_DIR)
+    except Exception as e:
+        print(f"❌  Could not pull queue data for {RUN_DATE}: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    mr_clinic_map, mr_queue_nid = {}, {}
+    for qr in queue_rows:
+        k = str(qr.get("MR", "")).strip()
+        if not k:
+            continue
+        mr_clinic_map.setdefault(k, qr.get("Clinic", "") or "")
+        if qr.get("National ID") and k not in mr_queue_nid:
+            mr_queue_nid[k] = str(qr["National ID"]).strip()
+
+    mr_codes = sorted(mr_clinic_map)
+    if not mr_codes:
+        print(f"❌  No arrived patients found for {RUN_DATE} — nothing to extract.")
+        sys.exit(1)
+    print(f"  Found {len(mr_codes)} arrived MR code(s) across "
+          f"{len(set(mr_clinic_map.values()))} clinic(s)")
+
+    patients = [{"mr": m, "national_id": mr_queue_nid.get(m, ""),
+                 "dates": {RUN_DATE: mr_clinic_map[m]}} for m in mr_codes]
+    new_data, errors = run_patients(patients)
+
     push_enabled = PUSH_TO_SUPABASE
     if push_enabled:
         print("\n── Testing Supabase connection …")
@@ -1516,220 +1746,36 @@ def main():
             print("  ⚠  Continuing with Excel-only output for this run.")
             push_enabled = False
 
-    # ── 1. Pull today's queue → {MR: Clinic} ───────────────────────
-    print(f"\n── Pulling queue report for {RUN_DATE} (source of MR codes + clinic) …")
-    try:
-        queue_rows = queue_mr_extractor.get_queue_records(
-            RUN_DATE, output_dir=QUEUE_OUTPUT_DIR
-        )
-    except Exception as e:
-        print(f"❌  Could not pull queue data for {RUN_DATE}: {e}")
-        traceback.print_exc()
-        sys.exit(1)
-
-    # queue_rows: one dict per queued patient (MR, Clinic, National ID,
-    # Appointment Number, Status, ...). Build the two lookups the loop
-    # below needs. A patient queued at several clinics keeps the FIRST
-    # clinic seen (the queue module already prints the conflicts).
-    mr_clinic_map = {}
-    mr_queue_nid = {}
-    for qr in queue_rows:
-        mr_key = str(qr.get("MR", "")).strip()
-        if not mr_key:
-            continue
-        mr_clinic_map.setdefault(mr_key, qr.get("Clinic", "") or "")
-        if qr.get("National ID") and mr_key not in mr_queue_nid:
-            mr_queue_nid[mr_key] = str(qr["National ID"]).strip()
-
-    mr_codes = sorted(mr_clinic_map.keys())
-    if not mr_codes:
-        print(f"❌  No queued patients found for {RUN_DATE} — nothing to extract.")
-        sys.exit(1)
-
-    preview = ", ".join(mr_codes[:6]) + ("…" if len(mr_codes) > 6 else "")
-    print(f"  Queue rows: {len(queue_rows)}  |  with National ID: {len(mr_queue_nid)}")
-    print(f"  Found {len(mr_codes)} queued MR code(s) across "
-          f"{len(set(mr_clinic_map.values()))} clinic(s): {preview}")
-
-    # ── 2. Login ────────────────────────────────────────────────────
-    print("\n── Logging in to CMIS MRM …")
-    session = build_session()
-    try:
-        if not login(session):
-            sys.exit(1)
-    except requests.exceptions.ConnectionError:
-        print("\n❌  Cannot reach the server.  "
-              "Make sure you are connected to the hospital network.")
-        sys.exit(1)
-
-    # ── Output containers (today's NEW rows only) ──────────────────
-    all_summary        = []
-    all_investigations  = []
-    all_med_reports     = []
-    all_mdt             = []
-    errors              = []
-
-    # ── 3. Process each MR ──────────────────────────────────────────
-    for idx, mr in enumerate(mr_codes, 1):
-        clinic = mr_clinic_map.get(mr, "")
-        print(f"\n{'─' * 65}")
-        print(f"  [{idx}/{len(mr_codes)}]  MR = {mr}   Clinic = {clinic}")
-
-        try:
-            time.sleep(DELAY)
-
-            # a. Patient basic info
-            patient_info = api_patient_get_by_mr(session, mr)
-            eng_name = patient_info.get("EngName", "")
-            ar_name  = patient_info.get("ARName", "")
-
-            # b. Authorize
-            time.sleep(DELAY)
-            if not api_authorize_patient(session, mr):
-                print(f"  ⚠  Not authorized for MR {mr} — skipping")
-                errors.append((mr, "Not authorized"))
-                continue
-
-            # c. Visit info
-            time.sleep(DELAY)
-            hosp_code, visit_num = api_draw_tree(session, mr)
-            if visit_num is None:
-                print(f"  ⚠  Could not determine visit number for MR {mr}")
-                visit_num = 0
-            print(f"  HospCode={hosp_code}  VisitNumber={visit_num}")
-
-            # d. Admission (full patient header)
-            time.sleep(DELAY)
-            admission = api_admission(session, mr, hosp_code, visit_num)
-            age       = admission.get("PatientAge", patient_info.get("PatientAge", ""))
-            sex       = admission.get("Sex",        patient_info.get("Sex", ""))
-            id_no     = admission.get("SixFieldDisplayValue", "")
-            # The queue report carries the patient's National ID too. Use it
-            # when CMIS's admission header has none, and flag disagreements
-            # (a mismatch usually means the queue's MR column is off).
-            q_nid = mr_queue_nid.get(mr, "")
-            if q_nid:
-                if not str(id_no or "").strip():
-                    id_no = q_nid
-                elif str(id_no).strip() != q_nid:
-                    print(f"  ⚠  National ID differs: CMIS={id_no}  queue={q_nid} "
-                          f"(kept CMIS value) — check MR {mr}")
-            birth_dt  = admission.get("FirstFieldDisplayValue", "")
-
-            all_summary.append([
-                mr, clinic, RUN_DATE, eng_name, ar_name, age, sex,
-                id_no, birth_dt, hosp_code, visit_num,
-            ])
-
-            # e. Patient note (mandatory API call in the workflow — no data kept)
-            time.sleep(DELAY)
-            api_patient_note(session, mr, hosp_code, visit_num)
-
-            # f. Investigations — keep only rows dated RUN_DATE
-            time.sleep(DELAY)
-            inv_list = api_investigations(session, mr)
-            inv_kept = 0
-            for inv in inv_list:
-                order_date_norm = _normalize_any_date(inv["Order Date"])
-                if order_date_norm != RUN_DATE:
-                    continue
-                all_investigations.append([
-                    mr, clinic,
-                    inv["Status"],
-                    inv["Order Type"],
-                    inv["Test Name"],
-                    inv["Physician Comment"],
-                    inv["Order Date"],
-                    inv["Requesting Physician"],
-                    inv["Schedule Date"],
-                    inv["Order Number"],
-                    inv["Case Number"],
-                    RUN_DATE,
-                ])
-                inv_kept += 1
-            print(f"  Investigations   : {inv_kept} dated {RUN_DATE} "
-                  f"(of {len(inv_list)} total on file)")
-
-            # g. Medical Sheets (filtered to 033 + 02, then to RUN_DATE)
-            time.sleep(DELAY)
-            target_sheets, token = api_medical_sheets(session, mr, hosp_code, visit_num)
-            mr_count = mdt_count = 0
-
-            for sheet in target_sheets:
-                time.sleep(DELAY)
-
-                # h. Get sheet URL
-                sheet_url = api_get_sheet_url(session, sheet, token)
-
-                # i. Get field data
-                time.sleep(DELAY)
-                fields = api_get_user_control_data(
-                    session, sheet_url, mr, hosp_code, visit_num, sheet
-                )
-
-                creation_date = sheet.get("CreationDate", "")
-                code = sheet["SheetCode"].strip()
-
-                if code == "033":
-                    date_str, description = extract_medical_report(fields, creation_date)
-                    if date_str != RUN_DATE:
-                        continue
-                    if description or date_str:
-                        all_med_reports.append([mr, clinic, eng_name, date_str, description, RUN_DATE])
-                        mr_count += 1
-
-                elif code == "02":
-                    date_str, outcome = extract_mdt(fields, creation_date)
-                    if date_str != RUN_DATE:
-                        continue
-                    if outcome or date_str:
-                        all_mdt.append([mr, clinic, eng_name, date_str, outcome, RUN_DATE])
-                        mdt_count += 1
-
-            print(f"  Medical Reports  : {mr_count} dated {RUN_DATE}")
-            print(f"  MDT Forms        : {mdt_count} dated {RUN_DATE}")
-
-        except requests.exceptions.ConnectionError as exc:
-            print(f"  ❌  Connection error: {exc}")
-            errors.append((mr, f"ConnectionError: {exc}"))
-        except requests.exceptions.Timeout:
-            print(f"  ❌  Request timed out")
-            errors.append((mr, "Timeout"))
-        except Exception as exc:
-            print(f"  ❌  Unexpected error: {exc}")
-            traceback.print_exc()
-            errors.append((mr, str(exc)))
-
-    # ── 4. Merge today's rows into the cumulative master + save ────
-    print(f"\n{'=' * 65}")
-    print("  Merging into cumulative master workbook …")
-
-    new_data = {
-        "summary":          all_summary,
-        "investigations":   all_investigations,
-        "medical_reports":  all_med_reports,
-        "mdt":              all_mdt,
-    }
-    run_info = {
-        "run_date":            RUN_DATE,
-        "timestamp":           ts_tag,
-        "mr_from_queue":       len(mr_codes),
-        "patients_processed":  len(all_summary),
-        "errors":              len(errors),
-    }
+    print(f"\n{'=' * 65}\n  Merging into cumulative master workbook …")
+    run_info = {"run_date": RUN_DATE, "timestamp": ts_tag,
+                "mr_from_queue": len(mr_codes),
+                "patients_processed": len({r[0] for r in new_data["summary"]}),
+                "errors": len(errors)}
     accumulate_and_save(new_data, MASTER_OUTPUT_PATH, run_info, push_enabled=push_enabled)
 
     print(f"\n  ✅  Extraction complete for {RUN_DATE}!")
-    print(f"  Patients processed (this run) : {len(all_summary)}/{len(mr_codes)}")
-    print(f"  Investigations (this run)     : {len(all_investigations)}")
-    print(f"  Medical Reports (this run)    : {len(all_med_reports)}")
-    print(f"  MDT Forms (this run)          : {len(all_mdt)}")
-    if errors:
-        print(f"  Errors / Skipped              : {len(errors)}")
-        for mr_err, reason in errors:
-            print(f"    MR {mr_err}: {reason}")
+    print(f"  Patients processed : {len(new_data['summary'])}/{len(mr_codes)}")
+    print(f"  Investigations     : {len(new_data['investigations'])}")
+    print(f"  Medical Reports    : {len(new_data['medical_reports'])}")
+    print(f"  MDT Forms          : {len(new_data['mdt'])}")
+    for m, why in errors:
+        print(f"    MR {m}: {why}")
     print(f"\n  Output → {MASTER_OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser(description="CMIS MRM patient data extractor")
+    ap.add_argument("run_date", nargs="?", default=None,
+                    help="single-day mode: dd-mm-yyyy (default today)")
+    ap.add_argument("--chunk", help="chunk mode: path to chunk_<n>.json from plan_chunks.py")
+    ap.add_argument("--chunk-out", help="chunk mode: where to write the result JSON")
+    args = ap.parse_args()
+    if args.chunk:
+        if not args.chunk_out:
+            ap.error("--chunk requires --chunk-out")
+        main_chunk(args.chunk, args.chunk_out)
+    else:
+        if args.run_date:
+            RUN_DATE = args.run_date
+        main()
