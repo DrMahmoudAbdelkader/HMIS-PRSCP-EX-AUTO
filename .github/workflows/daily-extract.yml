@@ -2,43 +2,58 @@ name: Daily DMS extraction (20:00 Cairo)
 
 on:
   schedule:
-    # Cairo now observes DST (EEST, UTC+3) roughly late-Apr -> late-Oct,
-    # and EET (UTC+2) the rest of the year. GitHub Actions cron is UTC-only
-    # and does NOT auto-adjust for DST, so we schedule BOTH possible UTC
-    # times and let the "Check it's actually 20:00 in Cairo" step below skip
-    # the wrong one. You don't need to touch this twice a year.
+    # Cairo observes DST (EEST, UTC+3) roughly late-Apr -> late-Oct, and
+    # EET (UTC+2) the rest of the year. GitHub Actions cron is UTC-only
+    # and does NOT adjust for DST, so BOTH possible UTC times are
+    # scheduled and the "gate" step below lets through only the slot that
+    # matches Cairo's CURRENT UTC offset. You don't need to touch this
+    # twice a year.
     #
     # Target: 20:00 Cairo
     #   EEST (UTC+3, summer): 20:00 - 3h = 17:00 UTC
     #   EET  (UTC+2, winter): 20:00 - 2h = 18:00 UTC
     - cron: "0 17 * * *"   # 20:00 Cairo when Cairo is UTC+3 (EEST, summer)
     - cron: "0 18 * * *"   # 20:00 Cairo when Cairo is UTC+2 (EET, winter)
-  workflow_dispatch: {}    # lets you also trigger it manually from the Actions tab
+  workflow_dispatch:       # manual run from the Actions tab
+    inputs:
+      run_date:
+        description: "Optional run date dd-mm-yyyy (blank = today, Cairo time)"
+        required: false
+        default: ""
+
+# Never let two runs overlap (a full run takes ~65-70 min): a second run
+# waits for the first instead of hitting HMIS/Supabase at the same time.
+concurrency:
+  group: daily-dms-extraction
+  cancel-in-progress: false
 
 jobs:
   extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # was 60 — the per-patient scraping loop needs ~65-70 min for a full run, this gives headroom for slower nights
+    timeout-minutes: 120   # the per-patient scraping loop needs ~65-70 min for a full run; headroom for slower nights
     steps:
-      - name: Check it's actually ~20:00 in Cairo right now
+      - name: Gate - run only the cron slot that matches Cairo's current UTC offset
         id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
           # GitHub's scheduled triggers are best-effort and can be delayed
-          # by anywhere from a few minutes to over an hour at busy times,
-          # so instead of requiring an exact HH:MM match we check that
-          # we're within a window after the 20:00 target. This also means
-          # only ONE of the two cron slots (summer/winter) will ever be
-          # "in window" on a given day, so there's no risk of it running twice.
-          now_minutes=$(TZ=Africa/Cairo date +%H:%M | awk -F: '{print $1*60+$2}')
-          target_minutes=$((20*60+0))     # 20:00
-          window_minutes=90               # accept up to 90 min of delay
+          # by minutes to over an hour. The old approach (accept anything
+          # within 90 min after 20:00 Cairo) let BOTH cron slots through in
+          # summer (17:00 UTC -> 20:00 Cairo, and 18:00 UTC -> 21:00 Cairo),
+          # so the extraction ran twice every night. Instead, decide by
+          # WHICH slot fired: it must be the one matching Cairo's UTC
+          # offset right now, however late GitHub starts it.
+          offset=$(TZ=Africa/Cairo date +%z)      # +0300 (summer) or +0200 (winter)
+          if [ "$offset" = "+0300" ]; then expected="0 17 * * *"; else expected="0 18 * * *"; fi
 
-          echo "Current Cairo time: $(TZ=Africa/Cairo date +%H:%M)"
+          echo "Cairo time now : $(TZ=Africa/Cairo date '+%Y-%m-%d %H:%M %z')"
+          echo "Trigger        : $EVENT_NAME  (schedule: '${SCHEDULE}')"
+          echo "Expected slot  : '$expected'"
 
-          diff=$(( (now_minutes - target_minutes + 1440) % 1440 ))
-
-          if [ "$diff" -gt "$window_minutes" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            echo "Not within the 20:00 Cairo window (DST offset didn't match this cron slot, or GitHub delayed the trigger too much) — skipping."
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$SCHEDULE" != "$expected" ]; then
+            echo "This cron slot doesn't match Cairo's current DST offset - skipping."
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -59,6 +74,10 @@ jobs:
       - name: Run the coupled extraction pipeline
         if: steps.gate.outputs.run == 'true'
         env:
+          # The script's default RUN_DATE is datetime.now(); pin the runner's
+          # clock to Cairo so "today" is always the Cairo date.
+          TZ: Africa/Cairo
+          INPUT_RUN_DATE: ${{ github.event.inputs.run_date }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           HMIS_USERNAME: ${{ secrets.HMIS_USERNAME }}
@@ -67,12 +86,22 @@ jobs:
           MASTER_OUTPUT_PATH: ${{ github.workspace }}/run-output/Cumulative_Patient_Clinical_Data.xlsx
         run: |
           mkdir -p "$QUEUE_OUTPUT_DIR"
-          python Extract_DMS_Patients_Prescriptioned_Services_Data_modified.py
+          # queue_mr_extractor.py must sit next to this script in the repo root
+          # (it is imported, not run).
+          if [ -n "$INPUT_RUN_DATE" ]; then
+            python Extract_DMS_Patients_Prescriptioned_Services_Data_modified.py "$INPUT_RUN_DATE"
+          else
+            python Extract_DMS_Patients_Prescriptioned_Services_Data_modified.py
+          fi
 
+      # always(): keep the raw/CLEAN queue files even when the run fails
+      # (e.g. "no queued patients" or a date-range mismatch) - that is
+      # exactly when you need them.
       - name: Upload run output as a workflow artifact (audit trail)
-        if: steps.gate.outputs.run == 'true'
+        if: always() && steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: dms-run-output-${{ github.run_id }}
           path: run-output/
+          if-no-files-found: ignore
           retention-days: 30
