@@ -4,7 +4,9 @@ CMIS MRM Patient Clinical Data Extractor  —  COUPLED daily pipeline
 CHANGES IN THIS VERSION (coupling with queue_mr_extractor.py)
 -----------------------------------------------------------------
 1. MR codes are no longer read from a hand-prepared Excel file. This
-   script now calls queue_mr_extractor.get_queue_mr_clinic_map() at
+   script now calls queue_mr_extractor.get_queue_records() (v12: a thin
+   adapter over the decree repo's queue_extractor.py + queue_parser.py,
+   which must sit next to this script) at
    startup, which pulls TODAY's (or a given RUN_DATE's) queue report
    and returns MR -> Clinic mapping directly (as either a dict, or a
    list of {"MR":..., "Clinic":...} dicts — both are handled, see
@@ -1517,7 +1519,7 @@ def main():
     # ── 1. Pull today's queue → {MR: Clinic} ───────────────────────
     print(f"\n── Pulling queue report for {RUN_DATE} (source of MR codes + clinic) …")
     try:
-        raw_map = queue_mr_extractor.get_queue_mr_clinic_map(
+        queue_rows = queue_mr_extractor.get_queue_records(
             RUN_DATE, output_dir=QUEUE_OUTPUT_DIR
         )
     except Exception as e:
@@ -1525,17 +1527,19 @@ def main():
         traceback.print_exc()
         sys.exit(1)
 
-    # queue_mr_extractor.get_queue_mr_clinic_map() has, at different
-    # times, returned either a {MR: Clinic} dict or a list of
-    # {"MR":..., "Clinic":...} dicts. Handle both so this doesn't
-    # silently break if the queue script changes shape again.
-    if isinstance(raw_map, dict):
-        mr_clinic_map = raw_map
-    elif isinstance(raw_map, list):
-        mr_clinic_map = {rec["MR"]: rec.get("Clinic", "") for rec in raw_map if rec.get("MR")}
-    else:
-        print(f"❌  Unexpected return type from get_queue_mr_clinic_map(): {type(raw_map)}")
-        sys.exit(1)
+    # queue_rows: one dict per queued patient (MR, Clinic, National ID,
+    # Appointment Number, Status, ...). Build the two lookups the loop
+    # below needs. A patient queued at several clinics keeps the FIRST
+    # clinic seen (the queue module already prints the conflicts).
+    mr_clinic_map = {}
+    mr_queue_nid = {}
+    for qr in queue_rows:
+        mr_key = str(qr.get("MR", "")).strip()
+        if not mr_key:
+            continue
+        mr_clinic_map.setdefault(mr_key, qr.get("Clinic", "") or "")
+        if qr.get("National ID") and mr_key not in mr_queue_nid:
+            mr_queue_nid[mr_key] = str(qr["National ID"]).strip()
 
     mr_codes = sorted(mr_clinic_map.keys())
     if not mr_codes:
@@ -1543,6 +1547,7 @@ def main():
         sys.exit(1)
 
     preview = ", ".join(mr_codes[:6]) + ("…" if len(mr_codes) > 6 else "")
+    print(f"  Queue rows: {len(queue_rows)}  |  with National ID: {len(mr_queue_nid)}")
     print(f"  Found {len(mr_codes)} queued MR code(s) across "
           f"{len(set(mr_clinic_map.values()))} clinic(s): {preview}")
 
@@ -1599,6 +1604,16 @@ def main():
             age       = admission.get("PatientAge", patient_info.get("PatientAge", ""))
             sex       = admission.get("Sex",        patient_info.get("Sex", ""))
             id_no     = admission.get("SixFieldDisplayValue", "")
+            # The queue report carries the patient's National ID too. Use it
+            # when CMIS's admission header has none, and flag disagreements
+            # (a mismatch usually means the queue's MR column is off).
+            q_nid = mr_queue_nid.get(mr, "")
+            if q_nid:
+                if not str(id_no or "").strip():
+                    id_no = q_nid
+                elif str(id_no).strip() != q_nid:
+                    print(f"  ⚠  National ID differs: CMIS={id_no}  queue={q_nid} "
+                          f"(kept CMIS value) — check MR {mr}")
             birth_dt  = admission.get("FirstFieldDisplayValue", "")
 
             all_summary.append([
