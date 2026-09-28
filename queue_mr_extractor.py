@@ -8,11 +8,8 @@ into the other):
 
     queue_extractor.py  ->  fetch_report(), verify_report_date_range(),
                             parse_clinic_report()      (HMIS WebReport export)
-    queue_parser.py     ->  extract_records_from_workbook_bytes()
-                            (fixed-column parser: Clinic, Serial No.,
-                             National ID Number, Patient File No.,
-                             Appointment Number/Date, User,
-                             Old Medical No., Status)
+    (queue_parser.py stays in the repo for reference; see the note on its
+     column map below.)
 
 PUBLIC API (used by Extract_DMS_Patients_Prescriptioned_Services_Data_modified.py)
 ------------------------------------------------------------------------------
@@ -24,24 +21,36 @@ PUBLIC API (used by Extract_DMS_Patients_Prescriptioned_Services_Data_modified.p
         Same contract as before (dict; {} on an empty day; RAISES on a real
         failure, never sys.exit).
 
+THE DATE-RANGE QUIRK (why D -> D+1)
+-----------------------------------
+HMIS treats the report's "To" date as an EXCLUSIVE midnight cut-off (each
+row's Appn_date carries a time, e.g. "01/09/2026 04.15.43"). A single-day
+request From=To=01/09/2026 therefore returns "No Data Found", while
+From=01/09/2026 To=02/09/2026 returns every appointment dated 01/09
+(verified on a real export: 534 rows, all dated 01/09/2026, none of 02/09).
+So for a run date D this module requests D -> D+1, then keeps only the rows
+whose own appointment date is D. If that comes back empty it also tries
+D -> D once, in case the server behaviour changes.
+
 WHICH REPORT / WHICH PARSER
 ---------------------------
-Reports are tried in this order (first one that yields rows wins):
-    1. queue_extractor.REPORT_CODE        (whatever the decree repo is set to)
-    2. the other of outpat_clnc_lst_det_j / outpat_clnc_lst_det_sts_j
-Each downloaded file is parsed with queue_parser first (National-ID layout)
-and, if that finds nothing, with queue_extractor.parse_clinic_report()
-(labelled Clinic/Doctor layout). This is needed because the two reports
-have different sheet layouts and the decree repo's own files disagree on
-which one is live (queue_extractor.py says det_j; queue_parser.py parses
-the _sts_ layout). Set QUEUE_REPORT_CODES="code1,code2" to force an order.
+Reports are tried in this order (first one that yields rows for D wins):
+    1. outpat_clnc_lst_det_sts_j   ("by Status" - verified layout below)
+    2. outpat_clnc_lst_det_j       (parsed with queue_extractor.parse_clinic_report)
+Override with QUEUE_REPORT_CODES="code1,code2".
 
-MR CODE
--------
-  * queue_parser layout : MR = "Patient File No." (column M). queue_parser.py
-    labels it a guess; earlier work confirmed it holds MR-shaped values
-    ("6891") while "Old Medical No." (AI) holds case numbers like 1132/2022.
-  * clinic-list layout  : MR = "Medical No."
+Verified layout of the "by Status" export (one patient = TWO sheet rows):
+    row 1:  D serial | H National ID | M MR code | U Appointment No. |
+            Z Appn_date+time | AN Old medical (case no. such as 3707/2020)
+    row 2:  AG Arrive_date+time | AK User
+Column "Status" (AM) is printed in the header but is empty in every data
+row of the sample. The fixed columns in queue_parser.py (Appn date=Y,
+User=AC, Old medical=AI) do NOT match this export, which is why this module
+reads the columns itself; queue_parser.py's Serial/ID/MR/Appointment-No.
+columns (D/H/M/U) are correct.
+
+MR CODE: "by Status" -> column M ("Patient File No." in queue_parser);
+clinic-list report -> "Medical No.".
 
 If a report comes back with zero rows, the first rows of the sheet are
 printed so the cause (blank report vs. layout change) is visible in the
@@ -53,13 +62,10 @@ import os
 import sys
 
 import queue_extractor as qx
-import queue_parser as qp
+import re
+from datetime import datetime, timedelta
 from openpyxl import load_workbook
 
-ALT_CODES = {
-    "outpat_clnc_lst_det_j": "outpat_clnc_lst_det_sts_j",
-    "outpat_clnc_lst_det_sts_j": "outpat_clnc_lst_det_j",
-}
 OUTPUT_DIR = os.environ.get("QUEUE_OUTPUT_DIR", r"D:\Queue_DMS_Data")
 
 
@@ -73,8 +79,7 @@ def _report_codes():
     forced = os.environ.get("QUEUE_REPORT_CODES", "").strip()
     if forced:
         return [c.strip() for c in forced.split(",") if c.strip()]
-    first = qx.REPORT_CODE
-    return [first, ALT_CODES.get(first, first)]
+    return ["outpat_clnc_lst_det_sts_j", "outpat_clnc_lst_det_j"]
 
 
 def _s(v):
@@ -101,18 +106,72 @@ def _dump_head(content, rows=12):
         print(f"      (could not open the file as a workbook: {e})")
 
 
-def _from_parser(rec):
-    return {
-        "MR": _s(rec.get("Patient File No.")),
-        "Clinic": _s(rec.get("Clinic")),
-        "National ID": _s(rec.get("National ID Number")),
-        "Appointment Number": _s(rec.get("Appointment Number")),
-        "Appointment Date": _s(rec.get("Appointment Date")),
-        "Serial No.": _s(rec.get("Serial No.")),
-        "Status": _s(rec.get("Status")),
-        "User": _s(rec.get("User")),
-        "Old Medical No.": _s(rec.get("Old Medical No.")),
-    }
+def _is_no_data(content):
+    """True when the server generated its blank 'No Data Found' sheet."""
+    try:
+        ws = load_workbook(io.BytesIO(content), data_only=True).active
+        for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 30), values_only=True):
+            for v in row:
+                if isinstance(v, str) and "no data found" in v.lower():
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+_DT_RE = re.compile(r"^(\d{2}/\d{2}/\d{4})[ .T]?(\d{2}[.:]\d{2}(?:[.:]\d{2})?)?")
+
+
+def _cell(ws, r, col, window=1):
+    """Value at (r, col) or the nearest populated column within +/-window."""
+    for d in [0] + [x for k in range(1, window + 1) for x in (-k, k)]:
+        c = col + d
+        if c >= 1:
+            v = ws.cell(row=r, column=c).value
+            if v not in (None, ""):
+                return v.strip() if isinstance(v, str) else v
+    return None
+
+
+def _clean_num(v):
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip()
+
+
+def _parse_status_export(content):
+    """Parse the verified 'by Status' layout -> list of raw dicts."""
+    ws = load_workbook(io.BytesIO(content), data_only=True).active
+    recs, clinic = [], None
+    for r in range(1, ws.max_row + 1):
+        if str(ws.cell(row=r, column=5).value or "").strip() == "Clinic":
+            v = _cell(ws, r, 10, window=2)
+            if v:
+                clinic = str(v).strip()
+            continue
+        serial = ws.cell(row=r, column=4).value
+        if not (isinstance(serial, (int, float)) or
+                (isinstance(serial, str) and serial.strip().isdigit())):
+            continue
+        appn = _cell(ws, r, 26, window=2)
+        m = _DT_RE.match(str(appn or ""))
+        arrive = _cell(ws, r + 1, 33, window=2)
+        recs.append({
+            "MR": _clean_num(_cell(ws, r, 13)),
+            "Clinic": clinic or "",
+            "National ID": _clean_num(_cell(ws, r, 8)),
+            "Appointment Number": _clean_num(_cell(ws, r, 21)),
+            "Appointment Date": m.group(1) if m else "",
+            "Appointment Time": (m.group(2) or "").replace(".", ":") if m else "",
+            "Serial No.": _clean_num(serial),
+            "Status": "",
+            "User": _clean_num(_cell(ws, r + 1, 37, window=1)),
+            "Old Medical No.": _clean_num(_cell(ws, r, 40, window=1)),
+            "Arrival": _s(arrive),
+        })
+    return recs
 
 
 def _from_clinic_list(rec):
@@ -129,35 +188,69 @@ def _from_clinic_list(rec):
     }
 
 
-def _pull_one(code, date_dash, out_dir):
-    """Fetch -> save raw -> verify range -> parse. Returns normalized rows."""
-    date_slash = qx.to_slash_date(date_dash)
-    print(f"   -> Fetching {code} for {date_slash} (single day)")
-    filename, content = qx.fetch_report(requests_session(), code, date_slash, date_slash)
+def _next_day(date_dash):
+    d = datetime.strptime(date_dash, "%d-%m-%Y") + timedelta(days=1)
+    return d.strftime("%d-%m-%Y")
 
+
+def _norm_date(v):
+    """dd/mm/yyyy (or dd-mm-yyyy [hh...]) -> 'dd-mm-yyyy', else ''."""
+    m = re.match(r"^(\d{2})[/-](\d{2})[/-](\d{4})", str(v or "").strip())
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
+
+
+def _fetch_range(code, from_dash, to_dash, out_dir):
+    """Fetch one (from, to) range -> (content, was_no_data). Saves the raw file."""
+    f_slash, t_slash = qx.to_slash_date(from_dash), qx.to_slash_date(to_dash)
+    print(f"   -> Fetching {code}  From={f_slash}  To={t_slash}")
+    filename, content = qx.fetch_report(requests_session(), code, f_slash, t_slash)
     os.makedirs(out_dir, exist_ok=True)
-    raw = os.path.join(out_dir, f"{date_dash}_to_{date_dash}_{filename}")
+    raw = os.path.join(out_dir, f"{from_dash}_to_{to_dash}_{filename}")
     with open(raw, "wb") as f:
         f.write(content)
     print(f"   -> Saved raw report ({len(content):,} bytes) -> {raw}")
+    if _is_no_data(content):
+        # the server's blank sheet has no From/To header -> check this BEFORE
+        # the date-range verification, or an empty range looks like a failure
+        return content, True
+    qx.verify_report_date_range(content, f_slash, t_slash)   # raises on mismatch
+    return content, False
 
-    qx.verify_report_date_range(content, date_slash, date_slash)   # raises on mismatch
 
-    rows = [_from_parser(r) for r in qp.extract_records_from_workbook_bytes(content)]
-    layout = "queue_parser"
-    if not rows:
+def _rows_from(code, content, day):
+    if code == "outpat_clnc_lst_det_sts_j":
+        rows = _parse_status_export(content)
+        layout = "by-status"
+    else:
         recs, warns = qx.parse_clinic_report(content)
         rows = [_from_clinic_list(r) for r in recs]
         layout = "clinic-list"
         for w in warns:
             _warn(w)
-    rows = [r for r in rows if r["MR"]]
+    total = len(rows)
+    rows = [r for r in rows if r["MR"] and _norm_date(r["Appointment Date"]) == day]
+    dropped = total - len(rows)
+    if dropped:
+        print(f"      kept {len(rows)} rows dated {day} (dropped {dropped} "
+              f"with another date or no MR)")
     for r in rows:
         r["Source"] = f"{code} ({layout})"
-    if not rows:
-        _warn(f"{code} produced 0 usable rows for {date_dash}. Head of the report:")
-        _dump_head(content)
     return rows
+
+
+def _pull_one(code, day, out_dir):
+    """One report for one day: try D->D+1 (server's To is exclusive), then D->D."""
+    for from_d, to_d in ((day, _next_day(day)), (day, day)):
+        content, no_data = _fetch_range(code, from_d, to_d, out_dir)
+        if no_data:
+            _warn(f"{code}: server returned 'No Data Found' for {from_d} -> {to_d}.")
+            continue
+        rows = _rows_from(code, content, day)
+        if rows:
+            return rows
+        _warn(f"{code}: {from_d} -> {to_d} gave no rows dated {day}. Head of the report:")
+        _dump_head(content)
+    return []
 
 
 def requests_session():
