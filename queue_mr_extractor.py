@@ -144,6 +144,7 @@ class QueueClient:
                 return r
             except Exception as e:
                 last = e
+                print(f"   !! {method} {url} try {attempt}/{RETRIES} failed: {e}")
                 time.sleep(1.5 * attempt)
         raise RuntimeError(f"{method} {url} failed after {RETRIES} tries: {last}")
 
@@ -264,7 +265,26 @@ class QueueClient:
             self._step_month(-1 if want < cur else 1)
         link = self._day_link_id(d.day)
         if not link:
-            raise RuntimeError(f"No calendar day link for {date_dash}")
+            # Current month: no chevron click happened, so cal_html is still the
+            # INITIAL full page, whose calendar markup differs from the partial
+            # update that works for past months. Force a partial re-render by
+            # stepping one month away and back.
+            try:
+                self._step_month(-1)
+                self._step_month(+1)
+            except Exception as e:
+                print(f"   !! calendar re-render failed: {e}")
+            link = self._day_link_id(d.day)
+        if not link:
+            try:                      # keep the raw calendar HTML for diagnosis
+                os.makedirs(OUTPUT_DIR, exist_ok=True)
+                with open(os.path.join(OUTPUT_DIR, f"calendar_debug_{date_dash}.html"),
+                          "w", encoding="utf-8") as fh:
+                    fh.write(self.cal_html)
+            except Exception:
+                pass
+            raise RuntimeError(f"No calendar day link for {date_dash} "
+                               f"(calendar month shown: {self._calendar_month()})")
         self.display_mode = "1"
         self._partial({"javax.faces.source": link, "javax.faces.partial.execute": link,
                        "javax.faces.partial.render": RENDER_DAY,
