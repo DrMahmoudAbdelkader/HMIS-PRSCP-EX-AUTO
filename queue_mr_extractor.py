@@ -237,12 +237,48 @@ class QueueClient:
             return None
         return int(m.group(2)), _MONTHS.get(m.group(1)[:3].lower())
 
+    def _calendar_cells(self):
+        """[(anchor_id, day_number)] for every numeric calendar anchor, in page order.
+        Tolerant on purpose: JSF auto-generated ids (j_idt104 / j_idt106 / j_idt108 ...)
+        change when the page structure changes, so we do not rely on them."""
+        cells = []
+        for m in re.finditer(r'<a\b[^>]*?\bid="([^"]+)"[^>]*>(.*?)</a>', self.cal_html, re.S):
+            aid = m.group(1)
+            if not aid.startswith("menuForm:"):
+                continue
+            txt = html_lib.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
+            if txt.isdigit() and 1 <= int(txt) <= 31:
+                cells.append((aid, int(txt)))
+        return cells
+
     def _day_link_id(self, day):
-        for m in re.finditer(r'<a id="(menuForm:j_idt104:\d+:j_idt106:\d+:j_idt108)"[^>]*>\s*(\d+)\s*</a>',
-                             self.cal_html):
-            if int(m.group(2)) == day:
-                return m.group(1)
+        cells = self._calendar_cells()
+        # The grid may also show trailing days of the previous month (28,29,30 ...)
+        # before the 1st and leading days of the next month after the last day.
+        # Keep only the increasing run that starts at the first "1".
+        start = next((i for i, (_, n) in enumerate(cells) if n == 1), 0)
+        run, prev = [], 0
+        for aid, n in cells[start:]:
+            if n <= prev:
+                break
+            run.append((aid, n))
+            prev = n
+        for aid, n in run:
+            if n == day:
+                return aid
         return None
+
+    def _calendar_diag(self):
+        cells = self._calendar_cells()
+        print(f"   !! calendar diag: {len(self.cal_html)} chars, "
+              f"{len(cells)} numeric day anchors, month={self._calendar_month()}")
+        print("   !! day anchors (first 45): " +
+              ", ".join(f"{n}={a.replace('menuForm:', '')}" for a, n in cells[:45]))
+        snippet = re.sub(r"\s+", " ", self.cal_html)
+        i = snippet.find('class="month"')
+        print("   !! calendar html near month header: " +
+              snippet[max(0, i - 100): i + 1500] if i >= 0 else
+              "   !! no month header; html start: " + snippet[:1500])
 
     def _step_month(self, direction):
         cls = "glyphicon-chevron-left" if direction < 0 else "glyphicon-chevron-right"
@@ -276,6 +312,7 @@ class QueueClient:
                 print(f"   !! calendar re-render failed: {e}")
             link = self._day_link_id(d.day)
         if not link:
+            self._calendar_diag()
             try:                      # keep the raw calendar HTML for diagnosis
                 os.makedirs(OUTPUT_DIR, exist_ok=True)
                 with open(os.path.join(OUTPUT_DIR, f"calendar_debug_{date_dash}.html"),
