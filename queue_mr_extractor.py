@@ -241,15 +241,23 @@ class QueueClient:
         """[(anchor_id, day_number)] for every numeric calendar anchor, in page order.
         Tolerant on purpose: JSF auto-generated ids (j_idt104 / j_idt106 / j_idt108 ...)
         change when the page structure changes, so we do not rely on them."""
-        cells = []
-        for m in re.finditer(r'<a\b[^>]*?\bid="([^"]+)"[^>]*>(.*?)</a>', self.cal_html, re.S):
-            aid = m.group(1)
-            if not aid.startswith("menuForm:"):
-                continue
-            txt = html_lib.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
-            if txt.isdigit() and 1 <= int(txt) <= 31:
-                cells.append((aid, int(txt)))
-        return cells
+        def scan(html):
+            out = []
+            for m in re.finditer(r'<a\b[^>]*?\bid="([^"]+)"[^>]*>(.*?)</a>', html, re.S):
+                aid = m.group(1)
+                if not aid.startswith("menuForm:"):
+                    continue
+                txt = html_lib.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
+                if txt.isdigit() and 1 <= int(txt) <= 31:
+                    out.append((aid, int(txt)))
+            return out
+
+        # Only look at the calendar itself (from the month header on): on the
+        # INITIAL full page other numeric links (pager, counters) can appear
+        # earlier and hijack the "run that starts at 1" logic.
+        i = self.cal_html.find('class="month"')
+        cells = scan(self.cal_html[i:]) if i >= 0 else []
+        return cells or scan(self.cal_html)
 
     def _day_link_id(self, day):
         cells = self._calendar_cells()
@@ -439,6 +447,7 @@ def extract_day(date_dash, client=None):
     c = client or QueueClient()
     if client is None:
         c.login()
+    print("   -> queue_mr_extractor v13.1 (calendar-fix build)")
     print(f"   -> Selecting {date_dash}")
     c.select_date(date_dash)
     want_iso = datetime.strptime(date_dash, "%d-%m-%Y").strftime("%Y-%m-%d")
